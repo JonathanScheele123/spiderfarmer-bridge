@@ -212,6 +212,20 @@ def translate_command(
         except (ValueError, TypeError):
             cmd = {"state": value}
         on = _onoff(cmd.get("state", "ON"))
+        # Mode-only change while the light is currently off: HA's
+        # light.turn_on always implies state=ON, so a dropdown pick from
+        # the card would briefly light up the bulb before the schedule's
+        # off-phase or another rule turns it back off — visible flicker.
+        # If the user only sent an effect (no brightness) and the light
+        # is currently off, preserve the off state and only update the
+        # modeType. The next on-phase / explicit turn-on uses the new
+        # mode without a transient flash.
+        if (
+            "effect" in cmd
+            and "brightness" not in cmd
+            and int(cur.get("on", cur.get("mOnOff", 0))) == 0
+        ):
+            on = 0
         if "brightness" in cmd:
             level = int(cmd["brightness"])
         else:
