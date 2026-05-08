@@ -40,5 +40,11 @@ printf 'interface=%s\nbind-interfaces\ndhcp-range=%s.10,%s.50,255.255.255.0,24h\
 
 iptables -t nat -F PREROUTING 2>/dev/null || true
 iptables -t nat -A PREROUTING -i "${IFACE}" -p tcp --dport 8883 -j REDIRECT --to-ports 8883
-sysctl -w net.ipv4.ip_forward=1 2>/dev/null || echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null || true
+# ip_forward: try sysctl first; the shell-level redirect to /proc fails
+# noisily on read-only /proc (no SYS_ADMIN), so wrap the fallback in a
+# subshell whose stderr is silenced. NAT REDIRECT in PREROUTING actually
+# works without ip_forward, so a failure here is non-fatal anyway.
+sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 \
+    || (echo 1 > /proc/sys/net/ipv4/ip_forward) 2>/dev/null \
+    || true
 echo "[INFO] Hotspot setup complete"
