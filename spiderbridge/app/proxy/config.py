@@ -77,7 +77,12 @@ def _build_config_from_ha_options(options: dict) -> dict:
         },
         "proxy": {
             "listen_host": "0.0.0.0",
-            "listen_port": 8883,
+            # 18883 not 8883: in HA addon mode we share host_network with
+            # the Mosquitto addon, which already binds 0.0.0.0:8883 for
+            # MQTT-over-TLS. cont-init/01-hotspot-setup adds an iptables
+            # PREROUTING REDIRECT 8883→18883 on wlan0 so the GGS still
+            # connects to its hardcoded port 8883.
+            "listen_port": 18883,
             # wlan0 and the SF upstream host are fixed for this add-on (single-purpose design)
             "upstream_host": "sf.mqtt.spider-farmer.com",
             "upstream_port": 8883,
