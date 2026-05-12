@@ -531,8 +531,22 @@ class MITMProxy:
             if s:
                 if s.initial_poll_task is not None and not s.initial_poll_task.done():
                     s.initial_poll_task.cancel()
-                s.publish_availability("offline")
-                self._sessions.pop(s.device_id, None)
+                # Only mark offline + remove from session registry if THIS
+                # session is still the current one. After a controller
+                # power-cycle the new CONNECT replaces _sessions[device_id]
+                # while the old TCP relay tasks are still draining; if we
+                # blindly publish offline here we'd flip HA to "unavailable"
+                # right after the new session marked the device online.
+                current = self._sessions.get(s.device_id)
+                if current is s:
+                    s.publish_availability("offline")
+                    self._sessions.pop(s.device_id, None)
+                else:
+                    logger.info(
+                        "[%s] stale session cleanup — newer session already active, "
+                        "skipping offline publish",
+                        s.device_id,
+                    )
             if upstream_writer:
                 try:
                     upstream_writer.close()
