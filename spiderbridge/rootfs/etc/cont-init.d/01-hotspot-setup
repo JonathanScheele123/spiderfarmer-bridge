@@ -14,6 +14,18 @@ CHANNEL=$(jq -r '.channel' /data/options.json)
 IP=$(jq -r '.hotspot_ip' /data/options.json)
 IFACE="wlan0"
 
+# Hosts without a wifi adapter (amd64 NUC / VM / bare-metal x86) have no
+# wlan0. Refuse to run hotspot setup there instead of crashing s6 on the
+# first `ip link set wlan0 up`. The proxy itself doesn't need the AP —
+# users on such hosts should disable the hotspot option AND steer the
+# GGS controller via DNS override on their router.
+if ! ip link show "${IFACE}" >/dev/null 2>&1; then
+    echo "[WARN] No ${IFACE} interface found — skipping hotspot setup."
+    echo "[WARN] Set hotspot_enabled: false in addon options on hosts without WiFi."
+    echo "[WARN] Steer the GGS controller via DNS override (sf.mqtt.spider-farmer.com → HA host IP)."
+    exit 0
+fi
+
 echo "[INFO] Setting up hotspot: ${SSID} on ${IFACE} (${IP})"
 
 mkdir -p /etc/NetworkManager/conf.d
