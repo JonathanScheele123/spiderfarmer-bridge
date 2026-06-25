@@ -24,3 +24,4 @@ TODO.md
 spiderbridge/frontend/node_modules/
 spiderbridge/frontend/dist/
 spiderbridge/frontend/coverage/
+.gstack/

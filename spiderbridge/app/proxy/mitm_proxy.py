@@ -309,8 +309,10 @@ class MITMProxy:
 
         try:
             ssl_ctx = self._build_upstream_ssl_ctx()
+            # Verbinde zur sauber aufgelösten IP (am Loop vorbei), aber SNI/Cert
+            # weiter über den Hostnamen.
             upstream_reader, upstream_writer = await asyncio.open_connection(
-                self.config["proxy"]["upstream_host"],
+                self.config["proxy"].get("upstream_ip") or self.config["proxy"]["upstream_host"],
                 self.config["proxy"]["upstream_port"],
                 ssl=ssl_ctx,
                 server_hostname=self.config["proxy"]["upstream_host"],
@@ -536,7 +538,7 @@ class MITMProxy:
             logger.warning("TLS MITM failed (%s) — transparent TCP relay fallback", e)
             await _tcp_relay_fallback(
                 client_reader, client_writer,
-                self.config["proxy"]["upstream_host"],
+                self.config["proxy"].get("upstream_ip") or self.config["proxy"]["upstream_host"],
                 self.config["proxy"]["upstream_port"],
             )
         except Exception as e:

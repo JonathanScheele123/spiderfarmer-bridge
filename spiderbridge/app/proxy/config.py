@@ -1,9 +1,74 @@
 import json
 import logging
+import random
+import socket
+import struct
 from pathlib import Path
 import yaml
 
 logger = logging.getLogger(__name__)
+
+# Bekannt-gute SF-Cloud-IP (EMQX, issuer O=MZ) als Fallback, falls der saubere
+# DNS-Lookup beim Boot scheitert. Stand 2026-06: sf.mqtt.spider-farmer.com.
+SF_UPSTREAM_FALLBACK_IP = "18.192.38.50"
+
+
+def _resolve_via_public_dns(
+    host: str,
+    fallback: str,
+    resolvers=("1.1.1.1", "8.8.8.8"),
+    timeout: float = 3.0,
+) -> str:
+    """A-Record über einen ÖFFENTLICHEN Resolver auflösen — am System-Resolver
+    vorbei.
+
+    Im DNS-Interception-Modus zeigt der lokale Resolver (dnsmasq) den Upstream
+    ``sf.mqtt.spider-farmer.com`` auf DIESEN Host zurück. Würde der Proxy seinen
+    Upstream über den System-Resolver auflösen, verbände er sich mit sich selbst
+    → Endlosschleife, GGS fällt ab. Darum hier eine eigenständige UDP-DNS-Abfrage
+    direkt an 1.1.1.1/8.8.8.8. Bei jedem Fehler: Fallback-IP.
+    """
+    qname = b"".join(
+        struct.pack("B", len(p)) + p.encode("ascii") for p in host.split(".")
+    ) + b"\x00"
+    query = (
+        struct.pack(">HHHHHH", random.randint(0, 0xFFFF), 0x0100, 1, 0, 0, 0)
+        + qname
+        + struct.pack(">HH", 1, 1)  # QTYPE=A, QCLASS=IN
+    )
+    for rs in resolvers:
+        sock = None
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.settimeout(timeout)
+            sock.sendto(query, (rs, 53))
+            data, _ = sock.recvfrom(512)
+            ancount = struct.unpack(">H", data[6:8])[0]
+            idx = 12
+            while data[idx] != 0:  # Frage-Namen überspringen
+                idx += data[idx] + 1
+            idx += 5  # 0-Byte + QTYPE(2) + QCLASS(2)
+            for _ in range(ancount):
+                if data[idx] & 0xC0 == 0xC0:  # komprimierter Name (Pointer)
+                    idx += 2
+                else:
+                    while data[idx] != 0:
+                        idx += data[idx] + 1
+                    idx += 1
+                rtype, _rclass, _ttl, rdlen = struct.unpack(">HHIH", data[idx:idx + 10])
+                idx += 10
+                if rtype == 1 and rdlen == 4:  # A-Record
+                    ip = ".".join(str(b) for b in data[idx:idx + 4])
+                    logger.info("Upstream %s via %s → %s (sauber, am Loop vorbei)", host, rs, ip)
+                    return ip
+                idx += rdlen
+        except Exception as e:  # noqa: BLE001 — jeder Fehler → nächster Resolver/Fallback
+            logger.warning("Sauberer DNS-Lookup über %s fehlgeschlagen: %s", rs, e)
+        finally:
+            if sock is not None:
+                sock.close()
+    logger.warning("Sauberer DNS-Lookup gescheitert — Fallback-IP %s", fallback)
+    return fallback
 
 HA_OPTIONS_PATH = "/data/options.json"
 HA_DEVICES_PATH = "/data/devices.yaml"
@@ -85,6 +150,12 @@ def _build_config_from_ha_options(options: dict) -> dict:
             "listen_port": 18883,
             # wlan0 and the SF upstream host are fixed for this add-on (single-purpose design)
             "upstream_host": "sf.mqtt.spider-farmer.com",
+            # Connect-Ziel = sauber aufgelöste IP (am vergifteten lokalen DNS
+            # vorbei), aber TLS-SNI/Cert weiter über upstream_host. Verhindert,
+            # dass der Proxy sich im DNS-Interception-Modus selbst aufruft.
+            "upstream_ip": _resolve_via_public_dns(
+                "sf.mqtt.spider-farmer.com", SF_UPSTREAM_FALLBACK_IP
+            ),
             "upstream_port": 8883,
             "cert_file": "certs/server.crt",
             "key_file": "certs/server.key",
