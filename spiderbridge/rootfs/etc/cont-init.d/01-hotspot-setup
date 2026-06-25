@@ -4,14 +4,37 @@ set -e
 HOTSPOT_ENABLED=$(jq -r '.hotspot_enabled' /data/options.json)
 
 if [ "${HOTSPOT_ENABLED}" != "true" ]; then
-    # DNS-Modus (kein Hotspot): der GGS wird per DNS-Override (sf.mqtt.spider-farmer.com
-    # -> HA-Host-IP) auf diesen Host gelenkt und trifft den Standard-MQTT-TLS-Port 8883.
-    # Mosquitto belegt aber selbst 8883 — ohne Redirect landet der Controller dort statt
-    # beim MITM-Proxy (18883). Darum den Redirect auch im DNS-Modus setzen.
-    echo "[INFO] Hotspot disabled — DNS mode: redirecting 8883 -> 18883 to the proxy"
+    # DNS-Interception-Modus (kein Hotspot, kein Pi-Ethernet noetig): dnsmasq laeuft als
+    # Netzwerk-DNS (nur Rewrite + Forwarding, KEIN DHCP). Der Router zeigt seinen
+    # lokalen DNS auf diesen Host; der GGS loest dann sf.mqtt.spider-farmer.com auf diese
+    # Host-IP auf, trifft 8883 -> per iptables auf den MITM-Proxy (18883) umgebogen
+    # (Mosquitto/anderes belegt 8883 sonst).
+    IFACE="wlan0"
+    HOST_IP=$(ip -4 addr show "${IFACE}" 2>/dev/null | grep -oE 'inet [0-9.]+' | awk '{print $2}' | head -1)
+    [ -z "${HOST_IP}" ] && HOST_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | grep -oE 'src [0-9.]+' | awk '{print $2}' | head -1)
+    GW=$(ip route 2>/dev/null | awk '/default/{print $3; exit}')
+    echo "[INFO] Hotspot disabled — DNS interception mode (host ${HOST_IP}, iface ${IFACE})"
+
     iptables -t nat -F PREROUTING 2>/dev/null || true
     iptables -t nat -A PREROUTING -p tcp --dport 8883 -j REDIRECT --to-ports 18883 2>/dev/null || true
     sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
+
+    mkdir -p /tmp/spiderbridge
+    chmod 700 /tmp/spiderbridge
+    {
+        echo "interface=${IFACE}"
+        echo "bind-interfaces"
+        echo "no-dhcp-interface=${IFACE}"
+        echo "no-resolv"
+        echo "address=/sf.mqtt.spider-farmer.com/${HOST_IP}"
+        # Lokale Router-Namen weiter beim Router aufloesen (kein Loop, da der Router
+        # nur diese Domain zurueckschickt); alles andere ueber oeffentliche Resolver.
+        [ -n "${GW}" ] && echo "server=/fritz.box/${GW}"
+        echo "server=1.1.1.1"
+        echo "server=8.8.8.8"
+    } > /tmp/spiderbridge/dnsmasq.conf
+    chmod 600 /tmp/spiderbridge/dnsmasq.conf
+    echo "[INFO] DNS rewrite ready: sf.mqtt.spider-farmer.com -> ${HOST_IP}"
     exit 0
 fi
 
