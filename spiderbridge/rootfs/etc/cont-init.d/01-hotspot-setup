@@ -4,7 +4,14 @@ set -e
 HOTSPOT_ENABLED=$(jq -r '.hotspot_enabled' /data/options.json)
 
 if [ "${HOTSPOT_ENABLED}" != "true" ]; then
-    echo "[INFO] Hotspot disabled — skipping setup"
+    # DNS-Modus (kein Hotspot): der GGS wird per DNS-Override (sf.mqtt.spider-farmer.com
+    # -> HA-Host-IP) auf diesen Host gelenkt und trifft den Standard-MQTT-TLS-Port 8883.
+    # Mosquitto belegt aber selbst 8883 — ohne Redirect landet der Controller dort statt
+    # beim MITM-Proxy (18883). Darum den Redirect auch im DNS-Modus setzen.
+    echo "[INFO] Hotspot disabled — DNS mode: redirecting 8883 -> 18883 to the proxy"
+    iptables -t nat -F PREROUTING 2>/dev/null || true
+    iptables -t nat -A PREROUTING -p tcp --dport 8883 -j REDIRECT --to-ports 18883 2>/dev/null || true
+    sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
     exit 0
 fi
 

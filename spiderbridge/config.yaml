@@ -1,6 +1,6 @@
-name: SpiderBridge
+name: SpiderBridge (DNS-Patch)
 slug: spiderbridge
-version: "1.6.7"
+version: "1.6.7-dns1"
 description: Spider Farmer GGS Controller → Home Assistant via MQTT Discovery
 url: https://github.com/iceboerg00/spiderfarmer-bridge
 # `image:` (pre-built GHCR pull) gets enabled by .github/workflows/
