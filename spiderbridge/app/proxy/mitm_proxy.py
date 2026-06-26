@@ -18,8 +18,9 @@ from ha.discovery import (
     publish_soil_sensor_discovery as _publish_soil_sensor_discovery,
     unpublish_outlet_discovery as _unpublish_outlet_discovery,
 )
-from .command_handler import translate_command
-from .config import HA_OPTIONS_PATH, HA_DEVICES_PATH
+from .command_handler import translate_command, LIGHT_MODE_TO_EFFECT, _onoff
+from .config import HA_OPTIONS_PATH, HA_DEVICES_PATH, HA_OVERRIDES_PATH
+from .override_manager import TempOverrideManager, compute_restore_at, MAX_OVERRIDE_SEC
 
 logger = logging.getLogger(__name__)
 
@@ -75,11 +76,14 @@ class ProxySession:
     def set_client(self, writer: asyncio.StreamWriter) -> None:
         self._client_writer = writer
 
-    async def inject(self, payload: dict) -> None:
-        """Inject command directly into the device TLS connection."""
+    async def inject(self, payload: dict) -> bool:
+        """Inject command directly into the device TLS connection. Returns
+        ``True`` only when the bytes were actually written + drained — callers
+        that gate irreversible state (e.g. clearing a light override) must NOT
+        treat a silent no-connection / write error as a delivered command."""
         if self._client_writer is None:
             logger.warning("[%s] inject: no device connection", self.device_id)
-            return
+            return False
         topic = f"SF/GGS/{self.down_topic_prefix}/API/DOWN/{self.mac.upper().replace(':', '')}"
         raw = build_publish(
             topic=topic,
@@ -89,8 +93,10 @@ class ProxySession:
             self._client_writer.write(raw)
             await self._client_writer.drain()
             logger.info("[%s] Command injected: %s", self.device_id, payload.get("params", {}))
+            return True
         except Exception as e:
             logger.error("[%s] inject error: %s", self.device_id, e)
+            return False
 
     def publish_availability(self, status: str) -> None:
         self.mqtt_client.publish(
@@ -107,6 +113,12 @@ class MITMProxy:
         self._config_path = config_path
         self._sessions: Dict[str, ProxySession] = {}
         self._known_soil_ids: Dict[str, set] = {}  # device_id → set of seen sensor IDs
+        # Temporary light overrides: a turn-off in Schedule/PPFD mode flips the
+        # lamp to Manual+off now and restores the original mode at the next
+        # schedule boundary. Persist only under HA OS (where /data exists);
+        # standalone keeps it in-memory.
+        persist = HA_OVERRIDES_PATH if Path(HA_OPTIONS_PATH).exists() else None
+        self.override_mgr = TempOverrideManager(persist)
 
     def build_server_ssl_ctx(self) -> ssl.SSLContext:
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -255,47 +267,226 @@ class MITMProxy:
                 logger.warning("Out-of-range outlet number in command: %s", field)
                 return
 
-        payload = translate_command(field, value, session.mac, session.uid, outlet_num,
-                                    device_state=session.device_state, subfield=subfield,
-                                    last_nonzero_level=session.last_nonzero_level,
-                                    fan_state=session.fan_state,
-                                    light_state=session.light_state)
+        # The bare light on/off path is intercepted for the temp-override
+        # behaviour (Schedule/PPFD off → Manual+off now, restore later). All
+        # other fields — and light *sub*field writes — go straight through.
+        if field in ("light", "light2") and subfield is None:
+            payload = self._light_payload_with_override(session, field, value)
+        else:
+            payload = translate_command(field, value, session.mac, session.uid, outlet_num,
+                                        device_state=session.device_state, subfield=subfield,
+                                        last_nonzero_level=session.last_nonzero_level,
+                                        fan_state=session.fan_state,
+                                        light_state=session.light_state)
         if payload:
-            await session.inject(payload)
-            # Optimistic update: write the fan/blower fields to the cache and
-            # publish per-field state topics so the new HA entities reflect
-            # the change without waiting for the next observed cloud echo.
-            params = payload.get("params", {})
-            for k in ("fan", "blower"):
-                blk = params.get(k)
-                if isinstance(blk, dict):
-                    session.fan_state[k] = blk
-                    for tpc, val in fan_extras_topics(session.device_id, k, blk).items():
-                        self.mqtt_client.publish(tpc, val, retain=True)
-            # Same for light — and refresh the main state/light JSON so
-            # the HA effect dropdown reflects the new mode immediately
-            # rather than waiting for the next getDevSta (which on some
-            # firmwares does not even carry modeType).
-            for k in ("light", "light2"):
-                blk = params.get(k)
-                if isinstance(blk, dict):
-                    # Merge, not overwrite — partial setConfigField frames
-                    # (e.g. just on/off or brightness) must not clobber a
-                    # previously cached modeType, otherwise the next status
-                    # update falls back to Manual mid-schedule.
-                    session.light_state.setdefault(k, {}).update(blk)
-                    # Pass the FULL merged cache to the normalizer, not the
-                    # partial blk — otherwise editing a sub-field like
-                    # schedule.timeOnStart republishes state/light with
-                    # state=OFF, brightness=0 (because blk has no on/level)
-                    # and clobbers the live light state in HA.
-                    merged = session.light_state[k]
-                    refreshed = normalize_status(
-                        session.device_id, {"data": {k: merged}},
-                        light_cache=session.light_state,
+            await self._inject_and_publish(session, payload)
+
+    async def _inject_and_publish(self, session: "ProxySession", payload: dict) -> bool:
+        """Inject a translated payload and optimistically reflect it into the
+        fan/light caches + HA state topics, so the UI updates without waiting
+        for the next controller echo. Shared by the command and restore paths.
+        Returns whether the inject actually reached the wire."""
+        ok = await session.inject(payload)
+        params = payload.get("params", {})
+        for k in ("fan", "blower"):
+            blk = params.get(k)
+            if isinstance(blk, dict):
+                session.fan_state[k] = blk
+                for tpc, val in fan_extras_topics(session.device_id, k, blk).items():
+                    self.mqtt_client.publish(tpc, val, retain=True)
+        # Light — refresh the main state/light JSON so the HA effect dropdown
+        # reflects the new mode immediately rather than waiting for the next
+        # getDevSta (which on some firmwares does not even carry modeType).
+        for k in ("light", "light2"):
+            blk = params.get(k)
+            if isinstance(blk, dict):
+                # Merge, not overwrite — partial setConfigField frames (e.g.
+                # just on/off or brightness) must not clobber a previously
+                # cached modeType, otherwise the next status update falls back
+                # to Manual mid-schedule.
+                session.light_state.setdefault(k, {}).update(blk)
+                # Pass the FULL merged cache to the normalizer, not the partial
+                # blk — otherwise editing a sub-field like schedule.timeOnStart
+                # republishes state/light with state=OFF, brightness=0 (because
+                # blk has no on/level) and clobbers the live light state in HA.
+                merged = session.light_state[k]
+                refreshed = normalize_status(
+                    session.device_id, {"data": {k: merged}},
+                    light_cache=session.light_state,
+                )
+                for tpc, val in refreshed.items():
+                    self.mqtt_client.publish(tpc, val, retain=True)
+        return ok
+
+    def _light_payload_with_override(
+        self, session: "ProxySession", field: str, value: str,
+    ) -> Optional[dict]:
+        """Resolve a bare light command, applying temporary-override semantics.
+
+        - explicit effect pick → clear any override, translate as-is
+        - turn ON while an override is pending → resume the original mode now
+        - turn OFF in Schedule/PPFD with no override → arm one: Manual+off now,
+          restore the original mode at the next schedule boundary
+        - everything else → normal mode-preserving translate
+        """
+        try:
+            cmd = json.loads(value)
+        except (ValueError, TypeError):
+            cmd = {"state": value}
+        cur = session.light_state.get(field) or session.device_state.get(field, {})
+        cur_mode = int(cur.get("modeType", 0))
+        has_effect = "effect" in cmd
+        has_brightness = "brightness" in cmd
+        state_on = _onoff(cmd.get("state", "ON"))
+        override = self.override_mgr.get(session.device_id, field)
+
+        def _translate(v):
+            return translate_command(
+                field, v, session.mac, session.uid, None,
+                device_state=session.device_state,
+                last_nonzero_level=session.last_nonzero_level,
+                light_state=session.light_state,
+            )
+
+        # Explicit mode pick — the user chose a mode deliberately; drop any
+        # pending override so it can't later stomp the user's choice.
+        if has_effect:
+            if override:
+                self.override_mgr.clear(session.device_id, field)
+                logger.info("[%s] Temp-Override verworfen — Nutzer wählte Modus %s",
+                            session.device_id, cmd.get("effect"))
+            return _translate(value)
+
+        # Manual resume: turning the lamp back on cancels the override and
+        # restores the original (Schedule/PPFD) mode immediately.
+        if override and state_on == 1 and not has_brightness:
+            orig = int(override["original_mode"])
+            self.override_mgr.clear(session.device_id, field)
+            effect = LIGHT_MODE_TO_EFFECT.get(orig, "Schedule")
+            logger.info("[%s] Temp-Override aufgehoben (manuelles AN) → Modus %s wiederhergestellt",
+                        session.device_id, effect)
+            return _translate(json.dumps({"state": "ON", "effect": effect}))
+
+        # Temp-override arm: OFF while in a non-Manual mode, none pending.
+        # Transactional ordering — build the Manual+off payload first, then
+        # persist the restore record, and only THEN return the payload (the
+        # caller injects it afterwards). If either step can't be guaranteed we
+        # fall through to the mode-preserving no-op so the lamp stays in its
+        # schedule rather than going dark with no way back.
+        if (state_on == 0 and not has_brightness and not has_effect
+                and not override and cur_mode in (1, 12)):
+            restore_at = self._compute_light_restore_at(cur, cur_mode)
+            if restore_at is None:
+                # Cold cache / no schedule → no computable boundary. Do NOT
+                # darken the lamp; warn so the case is visible in the log.
+                logger.warning(
+                    "[%s] Temp-Override Licht AUS: kein Schedule-Boundary berechenbar "
+                    "(Cache kalt?) → kein Override, Licht folgt weiter dem Plan",
+                    session.device_id,
+                )
+            else:
+                off_payload = _translate(json.dumps({"state": "OFF", "effect": "Manual"}))
+                if off_payload is None:
+                    logger.error(
+                        "[%s] Temp-Override: Manuell+Aus-Payload nicht baubar → "
+                        "kein Override", session.device_id,
                     )
-                    for tpc, val in refreshed.items():
-                        self.mqtt_client.publish(tpc, val, retain=True)
+                elif self.override_mgr.arm(session.device_id, field, cur_mode,
+                                           restore_at, armed_at=time.time()):
+                    logger.info(
+                        "[%s] Temp-Override Licht AUS (Modus %s) → Manuell+Aus jetzt, "
+                        "Modus-Wiederherstellung in %d s",
+                        session.device_id, LIGHT_MODE_TO_EFFECT.get(cur_mode, cur_mode),
+                        int(restore_at - time.time()),
+                    )
+                    return off_payload
+                else:
+                    # Persist failed → restore record is not durable. Refuse to
+                    # darken the lamp (an unrecoverable off is the worst case).
+                    logger.error(
+                        "[%s] Temp-Override: Persistenz fehlgeschlagen → Licht "
+                        "bleibt im Plan (kein Aus)", session.device_id,
+                    )
+
+        # Default: mode-preserving translate (current deployed behaviour).
+        return _translate(value)
+
+    def _compute_light_restore_at(self, cur: dict, cur_mode: int) -> Optional[float]:
+        """Epoch to restore the original mode, from the schedule cached in the
+        light block. PPFD uses ppfdPeriod, Schedule uses timePeriod.
+
+        The controller stores startTime/endTime as seconds-since-LOCAL-midnight,
+        so we derive now_local from the Pi's local clock. This assumes the Pi
+        (HA OS) and the GGS share a timezone — true on a single LAN. A DST jump
+        only shifts a restore by ≤1 h once, which at worst resumes the schedule
+        slightly early/late; it can never strand the lamp."""
+        period = cur.get("ppfdPeriod" if cur_mode == 12 else "timePeriod")
+        now = time.time()
+        lt = time.localtime(now)
+        now_local = lt.tm_hour * 3600 + lt.tm_min * 60 + lt.tm_sec
+        return compute_restore_at(now, now_local, period)
+
+    async def override_restore_loop(self) -> None:
+        """Every 30 s, restore the original mode for any override whose deadline
+        has passed. Hardened so the lamp is never left dark:
+          * a failed inject does NOT clear the override → retried next tick;
+          * a device offline at the deadline keeps the override (still due) and
+            is retried once it reconnects (self-healing across a proxy restart);
+          * a per-entry error never blocks the other overrides;
+          * an override for a device gone far past its window is evicted so it
+            can't fire a stale mode-switch on a future same-id controller."""
+        logger.info("Override restore loop started")
+        while True:
+            try:
+                await asyncio.sleep(30)
+                now = time.time()
+                for device_id, field, orig_mode in self.override_mgr.due(now):
+                    try:
+                        await self._restore_one(device_id, field, orig_mode, now)
+                    except Exception as e:
+                        logger.warning("[%s] Override restore error (retry next tick): %s",
+                                       device_id, e)
+            except asyncio.CancelledError:
+                logger.info("Override restore loop stopped")
+                break
+            except Exception as e:
+                logger.warning("Override restore loop error: %s", e)
+                await asyncio.sleep(30)
+
+    async def _restore_one(self, device_id: str, field: str, orig_mode: int,
+                           now: float) -> None:
+        """Restore a single due override. Clears the record ONLY when the
+        restore actually reached the controller — a silent inject failure or an
+        offline device keeps the override alive for the next tick. A device gone
+        past 2× the max window is evicted (stale, not stranded by us)."""
+        entry = self.override_mgr.get(device_id, field)
+        if entry and now - entry.get("armed_at", now) > 2 * MAX_OVERRIDE_SEC:
+            self.override_mgr.clear(device_id, field)
+            logger.warning("[%s] Temp-Override verfallen (Gerät zu lange offline) "
+                           "→ verworfen", device_id)
+            return
+        sess = self._sessions.get(device_id)
+        if sess is None:
+            return  # offline — still due, retry next tick
+        effect = LIGHT_MODE_TO_EFFECT.get(orig_mode, "Schedule")
+        payload = translate_command(
+            field, json.dumps({"state": "ON", "effect": effect}),
+            sess.mac, sess.uid, None,
+            device_state=sess.device_state,
+            last_nonzero_level=sess.last_nonzero_level,
+            light_state=sess.light_state,
+        )
+        if payload is None:
+            logger.error("[%s] Temp-Override Restore-Payload nicht baubar (Modus %s) "
+                         "→ erneuter Versuch", device_id, effect)
+            return
+        if await self._inject_and_publish(sess, payload):
+            self.override_mgr.clear(device_id, field)
+            logger.info("[%s] Temp-Override abgelaufen → Modus %s wiederhergestellt",
+                        device_id, effect)
+        else:
+            logger.warning("[%s] Temp-Override Restore-Inject fehlgeschlagen "
+                           "→ erneuter Versuch nächster Tick", device_id)
 
     async def handle_client(
         self,

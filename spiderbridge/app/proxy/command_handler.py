@@ -8,6 +8,11 @@ logger = logging.getLogger(__name__)
 
 _TIME_PERIOD = [{"weekmask": 127}]
 
+# Light modeType → HA effect label. Reverse of the in-function _EFFECT_TO_MODE
+# map; module-level so the temp-override path (mitm_proxy) can turn a remembered
+# modeType back into the effect string it must resend to restore the mode.
+LIGHT_MODE_TO_EFFECT = {0: "Manual", 1: "Schedule", 12: "PPFD"}
+
 # Reverse mapping of the fan modeType labels surfaced as preset_modes in HA.
 # Order here matches the SF App dropdown so the HA UI lists modes in the
 # same order the user sees in the App.

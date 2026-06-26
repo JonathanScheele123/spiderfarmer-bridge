@@ -73,6 +73,7 @@ def _resolve_via_public_dns(
 HA_OPTIONS_PATH = "/data/options.json"
 HA_DEVICES_PATH = "/data/devices.yaml"
 HA_MQTT_PATH = "/data/mqtt.json"  # written by cont-init/02b-mqtt-discovery
+HA_OVERRIDES_PATH = "/data/overrides.json"  # pending temporary light overrides
 
 
 # Hardcoded so HA generates entity_ids with a "ggs_*" prefix consistently

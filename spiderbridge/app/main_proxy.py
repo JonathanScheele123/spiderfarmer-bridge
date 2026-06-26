@@ -59,14 +59,20 @@ def main() -> None:
         # SF-App-side changes the user makes without HA interaction.
         poll_task = asyncio.create_task(proxy.config_poll_loop())
 
+        # Background restore for temporary light overrides: a Schedule/PPFD
+        # turn-off parks the lamp in Manual+off and this loop resumes the
+        # original mode at the next schedule boundary.
+        restore_task = asyncio.create_task(proxy.override_restore_loop())
+
         logger.info("Proxy listening on %s:%s", pcfg["listen_host"], pcfg["listen_port"])
         async with server:
             await stop.wait()
-        poll_task.cancel()
-        try:
-            await poll_task
-        except asyncio.CancelledError:
-            pass
+        for task in (poll_task, restore_task):
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
         logger.info("Shutting down")
 
     try:
