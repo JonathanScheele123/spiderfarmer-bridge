@@ -235,7 +235,16 @@ def translate_command(
             if on == 1 and level == 0:
                 level = int(last_levels.get(field, 100))
         level = max(0, min(100, level))
-        mode = _EFFECT_TO_MODE.get(cmd.get("effect"), 0)
+        # A plain turn_on/turn_off carries no "effect" → PRESERVE the
+        # controller's current modeType instead of forcing 0 (Manual).
+        # Forcing Manual on every HA toggle knocked the lamp out of its
+        # Schedule/PPFD photoperiod (real incident 2026-06-26: light stranded
+        # OFF in Manual overnight). Explicit effect still wins; unknown effect
+        # or empty cache falls back to the cached mode (0 when unknown).
+        if "effect" in cmd:
+            mode = _EFFECT_TO_MODE.get(cmd["effect"], int(cur.get("modeType", 0)))
+        else:
+            mode = int(cur.get("modeType", 0))
         return _build(mac, uid, "device", field, {
             "modeType": mode,
             "lastAutoModeType": cur.get("lastAutoModeType", 0),

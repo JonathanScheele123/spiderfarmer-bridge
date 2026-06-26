@@ -57,12 +57,32 @@ def test_light_legacy_effect_label_still_resolves_to_manual():
     assert r["params"]["light"]["modeType"] == 0
 
 
-def test_light_default_mode_is_manual():
-    # ON without explicit effect defaults to modeType 0 (Manual) — never
-    # Timer (1), even if the controller currently reports Timer.
+def test_light_toggle_without_effect_preserves_current_mode():
+    # A plain turn_on/turn_off (HA sends no "effect") must PRESERVE the
+    # controller's current modeType, not force Manual (0). Forcing Manual on
+    # every toggle knocked the lamp out of its Schedule/PPFD photoperiod —
+    # real incident 2026-06-26 (light stranded OFF in Manual overnight).
     val = json.dumps({"state": "ON", "brightness": 60})
     cur = {"light": {"modeType": 1, "level": 60}}
     r = translate_command("light", val, "AABBCC", "uid1", device_state=cur)
+    assert r["params"]["light"]["modeType"] == 1
+
+
+def test_light_turn_off_preserves_schedule_mode():
+    # Turning the light OFF must keep it in Schedule (modeType 1) so the
+    # controller resumes the photoperiod at the next scheduled transition.
+    val = json.dumps({"state": "OFF"})
+    cur = {"light": {"modeType": 1, "level": 60, "on": 1}}
+    r = translate_command("light", val, "AABBCC", "uid1", device_state=cur)
+    assert r["params"]["light"]["modeType"] == 1
+    assert r["params"]["light"]["mOnOff"] == 0
+
+
+def test_light_toggle_defaults_manual_when_cache_empty():
+    # With no cached controller state, a plain toggle still falls back to
+    # Manual (0) — the safe default when the current mode is unknown.
+    val = json.dumps({"state": "ON", "brightness": 60})
+    r = translate_command("light", val, "AABBCC", "uid1")
     assert r["params"]["light"]["modeType"] == 0
 
 
